@@ -1,0 +1,8 @@
+cookie.txt
+__pycache__/
+*.pyc
+*.log
+update_run.log
+*.db-wal
+*.db-shm
+vocus-search-*.zip
