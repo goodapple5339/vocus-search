@@ -142,8 +142,9 @@ def update():
         if _proc and _proc.poll() is None:
             return {"ok": False, "msg": "更新已在進行中"}
         logf = open(UPDATE_LOG, "w", encoding="utf-8")
-        _proc = subprocess.Popen([sys.executable, "crawl.py"], cwd=HERE,
-                                 stdout=logf, stderr=subprocess.STDOUT)
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+        _proc = subprocess.Popen([sys.executable, "-u", "crawl.py"], cwd=HERE,
+                                 stdout=logf, stderr=subprocess.STDOUT, env=env)
     return {"ok": True, "msg": "已開始更新"}
 
 @app.route("/update/stop", methods=["POST"])
@@ -170,7 +171,7 @@ def update_status():
     running = bool(_proc and _proc.poll() is None)
     lines = []
     try:
-        with open(UPDATE_LOG, encoding="utf-8") as fh:
+        with open(UPDATE_LOG, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except FileNotFoundError:
         pass
