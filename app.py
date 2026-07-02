@@ -4,8 +4,9 @@
 vocus 多創作者 全文搜尋 — 本機網頁介面
 啟動:  python3 app.py    然後瀏覽器開 http://127.0.0.1:5000
 """
-import os, re, sqlite3, html, sys, subprocess, threading
-from flask import Flask, request, render_template_string, abort
+import os, re, sqlite3, html, sys, subprocess, threading, json
+import urllib.request, urllib.parse
+from flask import Flask, request, render_template_string, abort, jsonify
 from sources import SOURCES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -199,6 +200,63 @@ def settings():
         pass
     return render_template_string(TPL_SETTINGS, msg=msg, has=has)
 
+@app.route("/vocus-login", methods=["POST"])
+def vocus_login():
+    data = request.get_json(force=True) or {}
+    email    = (data.get("email") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not email or not password:
+        return jsonify(ok=False, msg="請填寫帳號和密碼")
+
+    body = urllib.parse.urlencode({"email": email, "password": password}).encode()
+    req = urllib.request.Request(
+        "https://api.vocus.cc/api/users/login", data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer":     "https://vocus.cc/login",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            resp = json.loads(e.read().decode())
+        except Exception:
+            return jsonify(ok=False, msg=f"登入失敗（HTTP {e.code}）")
+        err = resp.get("error", "")
+        if "wrong" in err:
+            return jsonify(ok=False, msg="❌ 密碼錯誤，請再確認")
+        if "not found" in err:
+            return jsonify(ok=False, msg="❌ 找不到此帳號，請確認 Email")
+        return jsonify(ok=False, msg=f"❌ 登入失敗：{err}")
+    except Exception as e:
+        return jsonify(ok=False, msg=f"❌ 連線失敗：{e}")
+
+    token   = resp.get("token", "")
+    user_id = (resp.get("data") or {}).get("_id", "")
+    if not token:
+        return jsonify(ok=False, msg="❌ 登入失敗：伺服器未回傳 token")
+
+    # 保留舊的 cf_clearance（若存在）
+    cf_part = ""
+    try:
+        for part in open(COOKIE_FILE, encoding="utf-8").read().split(";"):
+            if "cf_clearance" in part:
+                cf_part = part.strip()
+                break
+    except FileNotFoundError:
+        pass
+
+    parts = [f"id_token={token}", f"userId={user_id}"]
+    if cf_part:
+        parts.append(cf_part)
+    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+        f.write("; ".join(parts) + "\n")
+
+    return jsonify(ok=True, msg="✅ 登入成功！回首頁按「🔄 更新資料」就能抓最新內容了。")
+
 # ----------------------------------------------------- templates
 BASE_CSS = """
 <style>
@@ -362,35 +420,83 @@ TPL_ARTICLE = """<!doctype html><html lang="zh-TW"><head><meta charset="utf-8">
 
 TPL_SETTINGS = """<!doctype html><html lang="zh-TW"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>設定 - vocus 全文搜尋</title>""" + BASE_CSS + """</head><body>
+<title>設定 - vocus 全文搜尋</title>""" + BASE_CSS + """
+<style>
+.login-box{background:#f8f9fa;border:1px solid #dde;border-radius:12px;padding:22px 24px;margin-bottom:24px}
+.login-box h2{margin:0 0 4px;font-size:18px}
+.login-box p.sub{color:#666;font-size:13px;margin:0 0 16px}
+.field{margin-bottom:12px}
+.field label{display:block;font-size:14px;font-weight:600;margin-bottom:4px}
+.field input{width:100%;padding:9px 12px;border:1px solid #ccc;border-radius:8px;font-size:15px;box-sizing:border-box}
+.btn-login{background:#0b8a99;color:#fff;border:0;padding:11px 28px;border-radius:8px;font-size:15px;cursor:pointer;width:100%;margin-top:4px}
+.btn-login:disabled{opacity:.6;cursor:default}
+#login-msg{margin-top:10px;font-size:14px;font-weight:700;min-height:20px}
+.divider{display:flex;align-items:center;gap:10px;margin:20px 0;color:#aaa;font-size:13px}
+.divider::before,.divider::after{content:'';flex:1;border-top:1px solid #ddd}
+</style>
+</head><body>
 <header><div class="wrap"><h1>⚙️ 設定</h1>
 <span class="meta"><a href="/" style="color:#fff">← 回搜尋</a></span></div></header>
 <div class="wrap">
   <div class="body">
-    <h2 style="margin-top:0">登入 Cookie（更新資料時才需要）</h2>
-    <p style="font-size:14px;color:#555">
-      目前狀態：{{ '✅ 已設定（要換新的就貼上覆蓋）' if has else '❌ 尚未設定' }}
+    <p style="font-size:14px;color:#555;margin-top:0">
+      目前狀態：{{ '✅ 已登入（可以更新資料）' if has else '❌ 尚未登入' }}
     </p>
     {% if msg %}<p style="font-size:15px;font-weight:700">{{msg}}</p>{% endif %}
+
+    <!-- 帳號密碼登入 -->
+    <div class="login-box">
+      <h2>🔑 用帳號密碼登入</h2>
+      <p class="sub">輸入你的 vocus.cc 帳號密碼，系統會自動取得登入憑證。</p>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="email" placeholder="your@email.com" autocomplete="email">
+      </div>
+      <div class="field">
+        <label>密碼</label>
+        <input type="password" id="pwd" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <button class="btn-login" id="btn-login" onclick="doLogin()">登入 vocus</button>
+      <div id="login-msg"></div>
+    </div>
+
+    <div class="divider">或手動貼入 Cookie</div>
+
+    <!-- 手動 Cookie（備用） -->
     <form method="post">
-      <textarea name="cookie" placeholder="把整段 cookie 貼在這裡…"
-        style="width:100%;height:120px;font-size:13px;padding:10px;border:1px solid #ccc;border-radius:8px"></textarea>
-      <div style="margin-top:10px"><button style="background:#0b8a99;color:#fff;border:0;padding:10px 22px;border-radius:8px;font-size:15px;cursor:pointer">儲存</button></div>
+      <textarea name="cookie" placeholder="把整段 cookie 貼在這裡…（備用方式）"
+        style="width:100%;height:100px;font-size:13px;padding:10px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box"></textarea>
+      <div style="margin-top:10px"><button style="background:#888;color:#fff;border:0;padding:9px 20px;border-radius:8px;font-size:14px;cursor:pointer">手動儲存 Cookie</button></div>
     </form>
-    <hr style="margin:22px 0;border:none;border-top:1px solid #eee">
-    <h3>怎麼拿到 cookie？（更新才需要，只想搜尋可略過）</h3>
-    <ol style="font-size:14px;color:#444;line-height:2">
-      <li>用電腦瀏覽器登入 <b>vocus.cc</b>（要有訂閱該創作者才抓得到付費內容）</li>
-      <li>按鍵盤 <b>F12</b> 打開開發者工具 → 上方切到 <b>Network（網路）</b> 分頁</li>
-      <li>重新整理頁面，點任一個請求 → 找到 <b>Request Headers</b> 裡的 <b>cookie</b> 那一整行</li>
-      <li>整行複製，貼到上面框框，按「儲存」</li>
-    </ol>
-    <p style="font-size:13px;color:#888">
-      註：cookie 大約一天會過期，更新時若提示過期，就重做一次以上步驟。<br>
-      若只是要搜尋現有資料，<b>完全不需要設定 cookie</b>。
+
+    <p style="font-size:13px;color:#aaa;margin-top:20px">
+      若只是要搜尋現有資料，<b>完全不需要登入</b>。登入憑證大約 8 天後過期，過期再重新登入即可。
     </p>
   </div>
-</div></body></html>"""
+</div>
+<script>
+async function doLogin(){
+  const email=document.getElementById('email').value.trim();
+  const pwd=document.getElementById('pwd').value;
+  const msg=document.getElementById('login-msg');
+  const btn=document.getElementById('btn-login');
+  if(!email||!pwd){msg.textContent='⚠️ 請填寫帳號和密碼';msg.style.color='#c00';return;}
+  btn.disabled=true;btn.textContent='登入中…';msg.textContent='';
+  try{
+    const r=await fetch('/vocus-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pwd})});
+    const d=await r.json();
+    msg.textContent=d.msg;
+    msg.style.color=d.ok?'#0a7a00':'#c00';
+    if(d.ok){btn.textContent='✅ 已登入';document.getElementById('pwd').value='';}
+    else{btn.disabled=false;btn.textContent='登入 vocus';}
+  }catch(e){
+    msg.textContent='❌ 網路錯誤：'+e;msg.style.color='#c00';
+    btn.disabled=false;btn.textContent='登入 vocus';
+  }
+}
+document.getElementById('pwd').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+</script>
+</body></html>"""
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)
