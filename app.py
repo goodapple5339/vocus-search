@@ -4,9 +4,9 @@
 vocus 多創作者 全文搜尋 — 本機網頁介面
 啟動:  python3 app.py    然後瀏覽器開 http://127.0.0.1:5000
 """
-import os, re, sqlite3, html, sys, subprocess, threading, json
+import os, re, sqlite3, html, sys, subprocess, threading, json, secrets, functools
 import urllib.request, urllib.parse
-from flask import Flask, request, render_template_string, abort, jsonify
+from flask import Flask, request, render_template_string, abort, jsonify, session, redirect, url_for
 from sources import SOURCES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -14,9 +14,18 @@ DB   = os.path.join(HERE, "vocus.db")
 UPDATE_LOG  = os.path.join(HERE, "update_run.log")
 COOKIE_FILE = os.path.join(HERE, "cookie.txt")
 app  = Flask(__name__)
+app.secret_key = secrets.token_hex(16)   # 每次重啟重產，session 失效需重新登入
 
 _proc = None                 # 目前更新中的子程序
 _lock = threading.Lock()
+
+def login_required(f):
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login_page"))
+        return f(*args, **kwargs)
+    return wrapped
 
 def src_name(key):
     return SOURCES.get(key, {}).get("name", key or "")
@@ -66,6 +75,7 @@ def highlight_full(text, q):
 
 # ----------------------------------------------------- routes
 @app.route("/")
+@login_required
 def index():
     q = (request.args.get("q") or "").strip()
     scope = request.args.get("scope", "all")   # all / article / comment / author
@@ -116,6 +126,7 @@ def index():
                                   na=a, nm=m)
 
 @app.route("/article/<aid>")
+@login_required
 def article(aid):
     q = (request.args.get("q") or "").strip()
     with conn() as c:
@@ -137,6 +148,7 @@ def article(aid):
 
 # ----------------------------------------------------- 資料更新（背景跑 crawl.py）
 @app.route("/update", methods=["POST"])
+@login_required
 def update():
     global _proc
     with _lock:
@@ -149,6 +161,7 @@ def update():
     return {"ok": True, "msg": "已開始更新"}
 
 @app.route("/update/stop", methods=["POST"])
+@login_required
 def update_stop():
     global _proc
     killed = False
@@ -168,6 +181,7 @@ def update_stop():
     return {"ok": True, "killed": killed}
 
 @app.route("/update/status")
+@login_required
 def update_status():
     running = bool(_proc and _proc.poll() is None)
     lines = []
@@ -183,6 +197,7 @@ def update_status():
             "done": done, "warn": warn, "tail": "\n".join(lines[-14:])}
 
 @app.route("/settings", methods=["GET", "POST"])
+@login_required
 def settings():
     msg = ""
     if request.method == "POST":
@@ -200,14 +215,49 @@ def settings():
         pass
     return render_template_string(TPL_SETTINGS, msg=msg, has=has)
 
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
+    error = ""
+    if request.method == "POST":
+        email    = (request.form.get("email") or "").strip()
+        password = (request.form.get("password") or "").strip()
+        if not email or not password:
+            error = "請填寫帳號和密碼"
+        else:
+            ok, msg, token, user_id = _do_vocus_login(email, password)
+            if ok:
+                session["logged_in"] = True
+                session["email"] = email
+                _save_cookie(token, user_id)
+                return redirect(url_for("index"))
+            else:
+                error = msg
+    return render_template_string(TPL_LOGIN, error=error)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
+
 @app.route("/vocus-login", methods=["POST"])
+@login_required
 def vocus_login():
+    """設定頁重新登入（更換帳號）"""
     data = request.get_json(force=True) or {}
     email    = (data.get("email") or "").strip()
     password = (data.get("password") or "").strip()
     if not email or not password:
         return jsonify(ok=False, msg="請填寫帳號和密碼")
+    ok, msg, token, user_id = _do_vocus_login(email, password)
+    if ok:
+        session["email"] = email
+        _save_cookie(token, user_id)
+    return jsonify(ok=ok, msg=msg)
 
+def _do_vocus_login(email, password):
+    """呼叫 vocus API 登入，回傳 (ok, msg, token, user_id)"""
     body = urllib.parse.urlencode({"email": email, "password": password}).encode()
     req = urllib.request.Request(
         "https://api.vocus.cc/api/users/login", data=body,
@@ -224,22 +274,23 @@ def vocus_login():
         try:
             resp = json.loads(e.read().decode())
         except Exception:
-            return jsonify(ok=False, msg=f"登入失敗（HTTP {e.code}）")
+            return False, f"登入失敗（HTTP {e.code}）", "", ""
         err = resp.get("error", "")
         if "wrong" in err:
-            return jsonify(ok=False, msg="❌ 密碼錯誤，請再確認")
+            return False, "密碼錯誤，請再確認", "", ""
         if "not found" in err:
-            return jsonify(ok=False, msg="❌ 找不到此帳號，請確認 Email")
-        return jsonify(ok=False, msg=f"❌ 登入失敗：{err}")
+            return False, "找不到此帳號，請確認 Email", "", ""
+        return False, f"登入失敗：{err}", "", ""
     except Exception as e:
-        return jsonify(ok=False, msg=f"❌ 連線失敗：{e}")
+        return False, f"連線失敗：{e}", "", ""
 
     token   = resp.get("token", "")
     user_id = (resp.get("data") or {}).get("_id", "")
     if not token:
-        return jsonify(ok=False, msg="❌ 登入失敗：伺服器未回傳 token")
+        return False, "登入失敗：伺服器未回傳 token", "", ""
+    return True, "登入成功", token, user_id
 
-    # 保留舊的 cf_clearance（若存在）
+def _save_cookie(token, user_id):
     cf_part = ""
     try:
         for part in open(COOKIE_FILE, encoding="utf-8").read().split(";"):
@@ -248,16 +299,50 @@ def vocus_login():
                 break
     except FileNotFoundError:
         pass
-
     parts = [f"id_token={token}", f"userId={user_id}"]
     if cf_part:
         parts.append(cf_part)
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         f.write("; ".join(parts) + "\n")
 
-    return jsonify(ok=True, msg="✅ 登入成功！回首頁按「🔄 更新資料」就能抓最新內容了。")
-
 # ----------------------------------------------------- templates
+TPL_LOGIN = """<!doctype html><html lang="zh-TW"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登入 - vocus 全文搜尋</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:"PingFang TC","Microsoft JhengHei","Noto Sans CJK TC",sans-serif;
+  margin:0;background:#f4f5f7;color:#222;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{background:#fff;border-radius:14px;padding:36px 32px;width:100%;max-width:380px;box-shadow:0 4px 24px rgba(0,0,0,.08)}
+h1{font-size:20px;margin:0 0 6px;color:#0b8a99}
+.sub{font-size:13px;color:#888;margin:0 0 24px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:600;margin-bottom:5px;color:#444}
+.field input{width:100%;padding:10px 12px;border:1px solid #ccc;border-radius:8px;font-size:15px}
+.field input:focus{outline:none;border-color:#0b8a99}
+.btn{width:100%;padding:12px;background:#0b8a99;color:#fff;border:0;border-radius:8px;
+  font-size:16px;cursor:pointer;margin-top:6px;font-weight:600}
+.btn:hover{background:#097a87}
+.err{color:#c0392b;font-size:14px;margin:8px 0 0;font-weight:600}
+</style></head><body>
+<div class="box">
+  <h1>🔍 vocus 全文搜尋</h1>
+  <p class="sub">請輸入你的 vocus.cc 帳號登入</p>
+  {% if error %}<p class="err">❌ {{ error }}</p>{% endif %}
+  <form method="post">
+    <div class="field">
+      <label>Email</label>
+      <input type="email" name="email" placeholder="your@email.com" autofocus autocomplete="email">
+    </div>
+    <div class="field">
+      <label>密碼</label>
+      <input type="password" name="password" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <button class="btn" type="submit">登入</button>
+  </form>
+</div>
+</body></html>"""
+
 BASE_CSS = """
 <style>
 *{box-sizing:border-box} body{font-family:"PingFang TC","Microsoft JhengHei",
@@ -305,7 +390,8 @@ TPL_INDEX = """<!doctype html><html lang="zh-TW"><head><meta charset="utf-8">
 <header><div class="wrap"><h1>🔍 vocus 創作者全文搜尋</h1>
 <span class="meta">{{na}} 篇文章 · {{nm}} 則留言 &nbsp;
 <button id="upbtn" onclick="startUpdate()">🔄 更新資料</button>
-<a href="/settings" style="color:#fff;margin-left:8px">⚙️ 設定</a></span></div></header>
+<a href="/settings" style="color:#fff;margin-left:8px">⚙️ 設定</a>
+<a href="/logout" style="color:#fff;margin-left:8px;opacity:.8">登出</a></span></div></header>
 <div class="wrap">
 <div id="upbox"><b class="st"></b>
   <button id="stopbtn" onclick="stopUpdate()" style="display:none">⏹ 停止更新</button>
@@ -436,7 +522,8 @@ TPL_SETTINGS = """<!doctype html><html lang="zh-TW"><head><meta charset="utf-8">
 </style>
 </head><body>
 <header><div class="wrap"><h1>⚙️ 設定</h1>
-<span class="meta"><a href="/" style="color:#fff">← 回搜尋</a></span></div></header>
+<span class="meta"><a href="/" style="color:#fff">← 回搜尋</a>
+<a href="/logout" style="color:#fff;margin-left:12px;opacity:.8">登出</a></span></div></header>
 <div class="wrap">
   <div class="body">
     <p style="font-size:14px;color:#555;margin-top:0">
